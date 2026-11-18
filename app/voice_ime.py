@@ -41,7 +41,7 @@ HOTWORDS_HEADER = ("# 热词替换：每行一条，格式：原文 -> 替换为
                    "# 以 # 开头的行会被忽略，修改后下次识别自动生效\n")
 ICON_NAME = "icon.ico"
 FLOAT_ICON_NAME = "float.ico"
-APP_RELEASE = "2.2.4"
+APP_RELEASE = "2.2.5"
 PROJECT_URL = "https://github.com/yc-2018/DoubaoVoiceIME"
 DEFAULT_HOTKEY = "RALT"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -1018,9 +1018,10 @@ def _send(events):
     return int(user32.SendInput(len(events), arr, ctypes.sizeof(INPUT)))
 
 
-def _vk_event(vk, up=False, extended=False):
+def _vk_event(vk, up=False, extended=False, extra=0):
     flags = (KEYEVENTF_KEYUP if up else 0) | (KEYEVENTF_EXTENDEDKEY if extended else 0)
-    return INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(vk, 0, flags, 0, None))
+    return INPUT(type=INPUT_KEYBOARD,
+                 ki=KEYBDINPUT(vk, 0, flags, 0, ctypes.c_void_p(extra)))
 
 
 def _uni_event(unit, up=False):
@@ -1126,6 +1127,11 @@ def paste_text(text, restore_text=None):
     if not _set_clipboard(text):
         return 0, 4
     time.sleep(0.05)
+    held = [n for n, vk in (("ctrl", 0x11), ("alt", 0x12), ("shift", 0x10))
+            if _async_down(vk)]
+    if held:
+        # Alt 残留会把 Ctrl+V 变成 AltGr+V，只输入一个 v
+        log("paste modifiers down: " + ",".join(held))
     sent = _send([_vk_event(0x11), _vk_event(0x56), _vk_event(0x56, True), _vk_event(0x11, True)])
     if restore_text is not None:
         time.sleep(0.25)
@@ -1471,6 +1477,18 @@ def _uia_verdict(before, after, text):
 
 def _async_down(vk):
     return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+
+
+_SIDE_MOD_VK = {"LCTRL": (0xA2, False), "RCTRL": (0xA3, True),
+                "LALT": (0xA4, False), "RALT": (0xA5, True),
+                "LSHIFT": (0xA0, False), "RSHIFT": (0xA1, True)}
+_RELEASE_TAG = 0x44565231
+
+
+def _release_side_mod(tok):
+    vk, extended = _SIDE_MOD_VK.get(tok, (0, False))
+    if vk:
+        _send([_vk_event(vk, True, extended, _RELEASE_TAG)])
 
 
 def _wait_modifiers_released(timeout=2.0):
@@ -1923,6 +1941,26 @@ class Hotkey:
             time.sleep(0.02)
         return True
 
+    def release_stale_mods(self, why="", ignore_down=False):
+        """补发抬起：钩子吞键后系统偶尔仍把快捷键修饰键记为按下。"""
+        owned = set()
+        for combo in (self.combo, self.smart_combo):
+            owned.update(t for t in (combo or ()) if t in _MOD_TOKENS)
+        stale = []
+        for tok in owned:
+            for side in MOD_GROUPS.get(tok, (tok,)):
+                vk = _SIDE_MOD_VK.get(side, (0, False))[0]
+                if vk and (ignore_down or side not in self.down) and _async_down(vk):
+                    stale.append(side)
+        for tok in stale:
+            self.swallowed.discard(tok)
+            self.down.discard(tok)
+            _release_side_mod(tok)
+        if stale:
+            log("release stale mods " + "+".join(sorted(stale))
+                + (" " + why if why else ""))
+        return stale
+
     def begin_capture(self):
         self.down.clear()
         self.cap_mods.clear()
@@ -2017,11 +2055,12 @@ class Hotkey:
             is_down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
             is_up = wParam in (WM_KEYUP, WM_SYSKEYUP)
             if (is_down or is_up) and self._handle_input(
-                    tok, is_down, bool(kb.flags & LLKHF_INJECTED)):
+                    tok, is_down, bool(kb.flags & LLKHF_INJECTED),
+                    int(kb.dwExtraInfo or 0)):
                 return 1
         return user32.CallNextHookEx(self.hook, nCode, wParam, lParam)
 
-    def _handle_input(self, tok, is_down, injected):
+    def _handle_input(self, tok, is_down, injected, extra=0):
         """键盘键和鼠标键共用的状态机，返回 True 表示吞掉该事件。"""
         if self.app.capturing:
             return self._capture(tok, is_down)
@@ -2076,12 +2115,16 @@ class Hotkey:
                     return True
         else:
             self.down.discard(tok)
-            if (self.active and self.active_mode == "hold"
+            if (self.active and self.active_mode == "hold" and extra != _RELEASE_TAG
                     and any(self._token_matches(c, tok) for c in self.combo)):
                 self.active = False
                 self.app.on_key_up(self.active_mode)
             if tok in self.swallowed:
                 self.swallowed.discard(tok)
+                if tok in _SIDE_MOD_VK and _async_down(_SIDE_MOD_VK[tok][0]):
+                    # 物理按键的异步状态可能在钩子之前就已更新，吞掉抬起后会残留
+                    _release_side_mod(tok)
+                    log(f"hotkey release cleanup {tok}")
                 return True
         return False
 
@@ -5236,6 +5279,8 @@ class App:
             if uia_before is not None:
                 log(f"inject uia before={len(uia_before)} chars")
         seq0 = self.input_seq()
+        # 注入发生在按键释放之后，此时修饰键都应为抬起；仍按下说明状态已残留
+        self.hotkey.release_stale_mods("before inject", ignore_down=True)
         log(f"injecting {len(text)} chars")
         sent, expected = inject_text(text, self.args.inject, snap["focus"])
         time.sleep(0.35)
@@ -5255,9 +5300,10 @@ class App:
                 uia_verified = res == "ok"
                 log(f"inject uia after={len(uia_after)} chars verdict={res}")
                 if (res == "fail" and not took_over
-                        and not uia_before.strip() and uia_after == uia_before
+                        and not uia_before.strip() and len(uia_after) <= 2
                         and _same_target(snap) and self.input_seq() == seq0):
-                    log("inject uia repair=set")
+                    # 粘贴被改成已按下的 Alt 抢占时只剩 v 之类的杂字，整框重写
+                    log(f"inject uia repair=set stray={uia_after!r}")
                     if _uia_write_input(snap["focus"], text):
                         uia_after = _uia_wait_input(snap["focus"], uia_before)
                         if uia_after is not None:
