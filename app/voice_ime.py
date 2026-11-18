@@ -41,7 +41,7 @@ HOTWORDS_HEADER = ("# 热词替换：每行一条，格式：原文 -> 替换为
                    "# 以 # 开头的行会被忽略，修改后下次识别自动生效\n")
 ICON_NAME = "icon.ico"
 FLOAT_ICON_NAME = "float.ico"
-APP_RELEASE = "2.2.2"
+APP_RELEASE = "2.2.3"
 DEFAULT_HOTKEY = "RALT"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "DoubaoVoice"
@@ -369,6 +369,7 @@ APP_VERSION = "0.9.3"
 LOCAL_ID_FILE = "doubao_local.json"
 LOCAL_FAIL_STREAK = 1
 LOCAL_ROTATE_COOLDOWN = 300.0
+LOCAL_MIN_FAIL_SPEECH = 1.0
 
 
 def _new_device_id():
@@ -4750,6 +4751,10 @@ class App:
             self.user_input_seq += 1
             self.undo_rec = None
 
+    def input_seq(self):
+        with self.input_lock:
+            return self.user_input_seq
+
     def smart_guard(self, seq):
         def check():
             if self.capturing or self.testing or self.session is not None:
@@ -5176,6 +5181,11 @@ class App:
         if not sess.had_speech:
             self.set_ui("done", "未识别到内容", auto_hide=2500)
             return
+        if sess.speech_sec < LOCAL_MIN_FAIL_SPEECH:
+            # 太短的语音本就不一定出结果，不能据此判断设备号失效
+            log(f"local asr empty speech={sess.speech_sec:.2f}s short -> keep did")
+            self.set_ui("done", "说话太短，未识别到内容", auto_hide=2500)
+            return
         log(f"local asr empty speech={sess.speech_sec:.2f}s")
         if not eng.note_failure():
             self.set_ui("done", "识别失败，请重试或切换引擎", auto_hide=3000, toast=True)
@@ -5208,19 +5218,28 @@ class App:
             uia_before = _uia_read_input(snap["focus"])
             if uia_before is not None:
                 log(f"inject uia before={len(uia_before)} chars")
+        seq0 = self.input_seq()
         log(f"injecting {len(text)} chars")
         sent, expected = inject_text(text, self.args.inject, snap["focus"])
         time.sleep(0.35)
         res = verify_injection(snap, text)
         uia_verified = False
+        took_over = False
         if uia_before is not None:
             uia_after = _uia_wait_input(snap["focus"], uia_before)
+            took_over = self.input_seq() != seq0
             if uia_after is not None:
                 res = _uia_verdict(uia_before, uia_after, text)
+                if res == "fail" and took_over:
+                    # 用户已回车发送或删改（常见于发送很快），输入框被清空后
+                    # 前后读数相同，不能再据此判定失败或补写，否则会把文字塞回去
+                    log("inject uia user-took-over verdict=unknown")
+                    res = "unknown"
                 uia_verified = res == "ok"
                 log(f"inject uia after={len(uia_after)} chars verdict={res}")
-                if (res == "fail" and not uia_before.strip()
-                        and uia_after == uia_before and _same_target(snap)):
+                if (res == "fail" and not took_over
+                        and not uia_before.strip() and uia_after == uia_before
+                        and _same_target(snap) and self.input_seq() == seq0):
                     log("inject uia repair=set")
                     if _uia_write_input(snap["focus"], text):
                         uia_after = _uia_wait_input(snap["focus"], uia_before)
@@ -5236,9 +5255,12 @@ class App:
                    and _weak_allowed(snap["focus"]))
         if weak_ok:
             log(f"inject weak-ok class={_class_name(snap['focus'])}")
-        if (res == "ok" or weak_ok) and sent_ok:
+        if (res == "ok" or weak_ok or took_over) and sent_ok:
             self.set_ui("done", f"✓ 已输入 {len(text)} 字", auto_hide=1500)
-            self.start_smart(text, snap["fg"], snap["focus"])
+            if took_over:
+                log("smart skip: user took over after inject")
+            else:
+                self.start_smart(text, snap["fg"], snap["focus"])
         elif res == "fail" or not sent_ok:
             if self.args.inject != "paste":
                 _set_clipboard(text)
