@@ -16,6 +16,7 @@ app/qwen.json
 app/wetype.json
 app/baidu.json
 app/doubao_api.json
+app/doubao_local.json
 
 # 本机设置（运行时生成）
 app/config.json

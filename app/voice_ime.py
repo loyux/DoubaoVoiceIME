@@ -7,6 +7,7 @@ import ctypes
 import json
 import os
 import re
+import secrets
 import struct
 import sys
 import threading
@@ -39,7 +40,7 @@ HOTWORDS_HEADER = ("# 热词替换：每行一条，格式：原文 -> 替换为
                    "# 以 # 开头的行会被忽略，修改后下次识别自动生效\n")
 ICON_NAME = "icon.ico"
 FLOAT_ICON_NAME = "float.ico"
-APP_RELEASE = "2.2.0"
+APP_RELEASE = "2.2.1"
 DEFAULT_HOTKEY = "RALT"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "DoubaoVoice"
@@ -360,18 +361,19 @@ QUIC_URL = b"wss://frontier-audio-ime-quic.doubao.com/api/v1/ws"
 WS_URL = b"wss://frontier-audio-ime-ws.doubao.com/ocean/api/v1/ws"
 PROTO_JSON = b'{"proto-version":"v2"}'
 APPKEY = b"OrnqKvSSrs"
-DEVICE_ID = "3330883888090203"
 AID = 685343
 APP_VERSION = "0.9.3"
-TOKEN = json.dumps({"device_id": DEVICE_ID, "aid": str(AID)})
-CTX = json.dumps({
-    "screen_width": 1920, "screen_height": 1080,
-    "device_platform": "windows", "device_brand": "PC", "device_model": "PC",
-    "os_version": "Windows 10", "device_type": "release", "channel": "ImeService",
-    "app_name": "oime_windows", "aid": str(AID), "os": "windows",
-    "device_id": DEVICE_ID, "version_name": APP_VERSION,
-    "app_version": APP_VERSION, "cellularProvider": "", "region": "cn",
-}, separators=(",", ":")).encode()
+LOCAL_ID_FILE = "doubao_local.json"
+
+
+def local_device_id():
+    saved = api_common.load_data(LOCAL_ID_FILE)
+    did = saved.get("device_id")
+    if isinstance(did, str) and did.isdigit() and 10 <= len(did) <= 20:
+        return did
+    did = str(secrets.randbelow(9 * 10**15) + 10**15)
+    api_common.save_data(LOCAL_ID_FILE, {"device_id": did})
+    return did
 
 
 class AsrEngine:
@@ -383,6 +385,16 @@ class AsrEngine:
         self._cbs = [PROTO(self._make_cb(i)) for i in range(5)]
         self.cfg = None
         self.extra = {}
+        self.device_id = local_device_id()
+        self.token = json.dumps({"device_id": self.device_id, "aid": str(AID)})
+        self.ctx = json.dumps({
+            "screen_width": 1920, "screen_height": 1080,
+            "device_platform": "windows", "device_brand": "PC", "device_model": "PC",
+            "os_version": "Windows 10", "device_type": "release", "channel": "ImeService",
+            "app_name": "oime_windows", "aid": str(AID), "os": "windows",
+            "device_id": self.device_id, "version_name": APP_VERSION,
+            "app_version": APP_VERSION, "cellularProvider": "", "region": "cn",
+        }, separators=(",", ":")).encode()
         # frontier(QUIC/UDP 443) 在很多网络被拦截，默认改走 cfg 里的 WebSocket(TCP)
         self.use_frontier = False
 
@@ -425,10 +437,11 @@ class AsrEngine:
         ctx12 = ctypes.create_string_buffer(0x40)
         ctypes.c_uint64.from_buffer(ctx12, 0x00).value = self._keep_bytes(QUIC_URL)
         ctypes.c_uint64.from_buffer(ctx12, 0x08).value = self._keep_bytes(PROTO_JSON)
-        ctypes.c_uint64.from_buffer(ctx12, 0x10).value = self._keep_bytes(CTX)
+        ctypes.c_uint64.from_buffer(ctx12, 0x10).value = self._keep_bytes(self.ctx)
         ctypes.c_uint32.from_buffer(ctx12, 0x18).value = 10
         ctypes.c_uint32.from_buffer(ctx12, 0x1C).value = AID
-        ctypes.c_uint64.from_buffer(ctx12, 0x20).value = self._keep_bytes(DEVICE_ID.encode())
+        ctypes.c_uint64.from_buffer(ctx12, 0x20).value = self._keep_bytes(
+            self.device_id.encode())
         ctypes.c_uint64.from_buffer(ctx12, 0x28).value = self._keep_bytes(APP_VERSION.encode())
         ctypes.c_uint32.from_buffer(ctx12, 0x34).value = 5000
         ctypes.c_uint32.from_buffer(ctx12, 0x38).value = 3
@@ -451,11 +464,12 @@ class AsrEngine:
             ctypes.c_uint64.from_buffer(pool, 0x00).value = self._keep_bytes(b"oime_windows")
             ctypes.c_uint64.from_buffer(pool, 0x08).value = self._keep_bytes(QUIC_URL + b";")
             ctypes.c_uint64.from_buffer(pool, 0x10).value = self._keep_bytes(APPKEY)
-            ctypes.c_uint64.from_buffer(pool, 0x18).value = self._keep_bytes(TOKEN.encode())
+            ctypes.c_uint64.from_buffer(pool, 0x18).value = self._keep_bytes(
+                self.token.encode())
             ctypes.c_uint32.from_buffer(pool, 0x20).value = 5000
             ctypes.c_uint32.from_buffer(pool, 0x24).value = 0
             ctypes.c_uint64.from_buffer(pool, 0x28).value = self._keep_bytes(PROTO_JSON)
-            ctypes.c_uint64.from_buffer(pool, 0x30).value = self._keep_bytes(CTX)
+            ctypes.c_uint64.from_buffer(pool, 0x30).value = self._keep_bytes(self.ctx)
             ctypes.c_uint32.from_buffer(pool, 0x38).value = 1
             ctypes.c_uint32.from_buffer(pool, 0x3C).value = 3
             ctypes.c_uint32.from_buffer(pool, 0x40).value = 2
@@ -486,10 +500,10 @@ class AsrEngine:
         put64(0x00, self._keep_bytes(WS_URL))
         put64(0x08, self._keep_bytes(APPKEY))
         put64(0x10, self._keep_bytes(PROTO_JSON))
-        put64(0x18, self._keep_bytes(CTX))
+        put64(0x18, self._keep_bytes(self.ctx))
         put64(0x28, self._keep_bytes(b""))
         put32(0x38, 1)
-        put64(0x40, self._keep_bytes(TOKEN.encode()))
+        put64(0x40, self._keep_bytes(self.token.encode()))
         put64(0x48, self._keep_bytes(b"speech_opus"))
         put32(0x50, 16000)
         put32(0x54, 1)
