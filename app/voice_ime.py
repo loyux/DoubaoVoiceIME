@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 import wave
 import winreg
 from ctypes import wintypes
@@ -40,7 +41,7 @@ HOTWORDS_HEADER = ("# 热词替换：每行一条，格式：原文 -> 替换为
                    "# 以 # 开头的行会被忽略，修改后下次识别自动生效\n")
 ICON_NAME = "icon.ico"
 FLOAT_ICON_NAME = "float.ico"
-APP_RELEASE = "2.2.1"
+APP_RELEASE = "2.2.2"
 DEFAULT_HOTKEY = "RALT"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "DoubaoVoice"
@@ -328,6 +329,8 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+ole32 = ctypes.WinDLL("ole32")
+oleaut32 = ctypes.WinDLL("oleaut32")
 kernel32.GetCurrentProcess.restype = ctypes.c_void_p
 kernel32.ReadProcessMemory.restype = ctypes.c_int
 kernel32.ReadProcessMemory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -364,16 +367,34 @@ APPKEY = b"OrnqKvSSrs"
 AID = 685343
 APP_VERSION = "0.9.3"
 LOCAL_ID_FILE = "doubao_local.json"
+LOCAL_FAIL_STREAK = 1
+LOCAL_ROTATE_COOLDOWN = 300.0
 
 
-def local_device_id():
+def _new_device_id():
+    return str(secrets.randbelow(9 * 10**15) + 10**15)
+
+
+def local_identity():
     saved = api_common.load_data(LOCAL_ID_FILE)
     did = saved.get("device_id")
     if isinstance(did, str) and did.isdigit() and 10 <= len(did) <= 20:
-        return did
-    did = str(secrets.randbelow(9 * 10**15) + 10**15)
-    api_common.save_data(LOCAL_ID_FILE, {"device_id": did})
-    return did
+        return saved
+    saved["device_id"] = _new_device_id()
+    api_common.save_data(LOCAL_ID_FILE, saved)
+    return saved
+
+
+def rotate_device_id(old_did):
+    saved = api_common.load_data(LOCAL_ID_FILE)
+    new_did = _new_device_id()
+    while new_did == old_did:
+        new_did = _new_device_id()
+    saved["device_id"] = new_did
+    saved["fail_streak"] = 0
+    saved["last_rotate"] = time.time()
+    api_common.save_data(LOCAL_ID_FILE, saved)
+    return new_did
 
 
 class AsrEngine:
@@ -385,18 +406,32 @@ class AsrEngine:
         self._cbs = [PROTO(self._make_cb(i)) for i in range(5)]
         self.cfg = None
         self.extra = {}
-        self.device_id = local_device_id()
-        self.token = json.dumps({"device_id": self.device_id, "aid": str(AID)})
+        state = local_identity()
+        try:
+            self.fail_streak = max(0, int(state.get("fail_streak") or 0))
+        except (TypeError, ValueError):
+            self.fail_streak = 0
+        try:
+            self.last_rotate = float(state.get("last_rotate") or 0.0)
+        except (TypeError, ValueError):
+            self.last_rotate = 0.0
+        self._warm_lock = threading.Lock()
+        self._fail_lock = threading.Lock()
+        self._set_identity(state["device_id"])
+        # frontier(QUIC/UDP 443) 在很多网络被拦截，默认改走 cfg 里的 WebSocket(TCP)
+        self.use_frontier = False
+
+    def _set_identity(self, did):
+        self.device_id = did
+        self.token = json.dumps({"device_id": did, "aid": str(AID)})
         self.ctx = json.dumps({
             "screen_width": 1920, "screen_height": 1080,
             "device_platform": "windows", "device_brand": "PC", "device_model": "PC",
             "os_version": "Windows 10", "device_type": "release", "channel": "ImeService",
             "app_name": "oime_windows", "aid": str(AID), "os": "windows",
-            "device_id": self.device_id, "version_name": APP_VERSION,
+            "device_id": did, "version_name": APP_VERSION,
             "app_version": APP_VERSION, "cellularProvider": "", "region": "cn",
         }, separators=(",", ":")).encode()
-        # frontier(QUIC/UDP 443) 在很多网络被拦截，默认改走 cfg 里的 WebSocket(TCP)
-        self.use_frontier = False
 
     def new_session(self, verbose=False, on_text=None):
         return AsrSession(self, verbose, on_text)
@@ -429,6 +464,12 @@ class AsrEngine:
         self.loaded = True
 
     def warmup(self):
+        with self._warm_lock:
+            if self.ready.is_set():
+                return
+            self._warmup()
+
+    def _warmup(self):
         if not self.loaded:
             self.load()
         t0 = time.perf_counter()
@@ -483,6 +524,44 @@ class AsrEngine:
         self._build_cfg()
         self.ready.set()
         log(f"engine ready in {time.perf_counter() - t0:.2f}s")
+
+    def rotate_device(self):
+        with self._warm_lock:
+            self.ready.clear()
+            new_did = rotate_device_id(self.device_id)
+            self._set_identity(new_did)
+            self.fail_streak = 0
+            self.last_rotate = time.time()
+            log(f"local did rotated -> {new_did}")
+            self._warmup()
+            return new_did
+
+    def note_success(self):
+        with self._fail_lock:
+            if self.fail_streak == 0:
+                return
+            self.fail_streak = 0
+            state = api_common.load_data(LOCAL_ID_FILE)
+            state["device_id"] = self.device_id
+            state["fail_streak"] = 0
+            api_common.save_data(LOCAL_ID_FILE, state)
+            log("local did failure streak reset")
+
+    def note_failure(self):
+        with self._fail_lock:
+            self.fail_streak += 1
+            state = api_common.load_data(LOCAL_ID_FILE)
+            state["device_id"] = self.device_id
+            state["fail_streak"] = self.fail_streak
+            api_common.save_data(LOCAL_ID_FILE, state)
+            wait = LOCAL_ROTATE_COOLDOWN - (time.time() - self.last_rotate)
+            if self.fail_streak < LOCAL_FAIL_STREAK:
+                log(f"local did failure streak={self.fail_streak}")
+                return False
+            if wait > 0:
+                log(f"local did rotate cooldown {int(wait)}s")
+                return False
+            return True
 
     def _build_cfg(self):
         cfg = ctypes.create_string_buffer(0x100)
@@ -559,12 +638,18 @@ class AsrSession:
         self.cancelled = False
         self.closed = False
         self.text = ""
+        self.speech_sec = 0.0
+        self.finished = False
         self.seq = 0
         self.feed_thread = None
 
     @property
     def dll(self):
         return self.engine.dll
+
+    @property
+    def had_speech(self):
+        return self.speech_sec >= 0.2
 
     def push(self, data):
         if self.cancelled or self.closed:
@@ -574,6 +659,18 @@ class AsrSession:
             cap = 16000 * 2 * 30
             if len(self.audio) > cap:
                 del self.audio[:len(self.audio) - cap]
+        self._track_speech(data)
+
+    def _track_speech(self, data):
+        n = len(data) // 2
+        if n <= 0:
+            return
+        samples = memoryview(data)[:n * 2].cast("h")
+        total = 0
+        for sample in samples:
+            total += sample * sample
+        if total >= n * 300 * 300:
+            self.speech_sec += n / 16000.0
 
     def request_release(self):
         self.release_evt.set()
@@ -695,6 +792,7 @@ class AsrSession:
         rc = self.dll.SAMICoreSetProperty(self.h, 0xA2A, None)
         log(f"finish rc={rc}")
         self.final_evt.wait(4.0)
+        self.finished = True
         log(f"final after {time.perf_counter() - t:.2f}s text={self.text!r}")
 
     def close(self):
@@ -928,7 +1026,10 @@ def _uni_event(unit, up=False):
     return INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(0, unit, flags, 0, None))
 
 
-def type_text(text):
+QT_TYPE_DELAY = 0.02
+
+
+def type_text(text, char_delay=0.0):
     # 编辑控件普遍忽略 U+000A/U+000D；用 Shift+Enter 插入换行，避免聊天框 Enter 直接发送
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     events = []
@@ -942,9 +1043,15 @@ def type_text(text):
             events.append(_uni_event(unit, False))
             events.append(_uni_event(unit, True))
     sent = 0
-    for j in range(0, len(events), 64):
-        sent += _send(events[j:j + 64])
-        time.sleep(0.002)
+    if char_delay > 0:
+        # 微信 4.x 等 Qt 输入框一次灌入整段文字会丢字，按字符节奏发送
+        for j in range(0, len(events), 2):
+            sent += _send(events[j:j + 2])
+            time.sleep(char_delay)
+    else:
+        for j in range(0, len(events), 64):
+            sent += _send(events[j:j + 64])
+            time.sleep(0.002)
     return sent, len(events)
 
 
@@ -955,6 +1062,8 @@ user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
 user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
 user32.GetClipboardData.argtypes = [wintypes.UINT]
 user32.GetClipboardData.restype = ctypes.c_void_p
+user32.EnumClipboardFormats.argtypes = [wintypes.UINT]
+user32.EnumClipboardFormats.restype = wintypes.UINT
 kernel32.GlobalAlloc.restype = ctypes.c_void_p
 kernel32.GlobalLock.restype = ctypes.c_void_p
 kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
@@ -981,34 +1090,44 @@ def _set_clipboard(text):
     return True
 
 
-def _get_clipboard_text():
+def _clipboard_peek():
+    """返回 (剪贴板文字或 None, 是否有任何数据)；打不开剪贴板时返回 (None, None)。"""
     for _ in range(10):
         if user32.OpenClipboard(None):
             break
         time.sleep(0.02)
     else:
-        return None
+        return None, None
     try:
+        has_data = bool(user32.EnumClipboardFormats(0))
         if not user32.IsClipboardFormatAvailable(13):
-            return None
+            return None, has_data
         handle = user32.GetClipboardData(13)
         if not handle:
-            return None
+            return None, has_data
         ptr = kernel32.GlobalLock(ctypes.c_void_p(handle))
         if not ptr:
-            return None
+            return None, has_data
         try:
-            return ctypes.wstring_at(ptr)
+            return ctypes.wstring_at(ptr), has_data
         finally:
             kernel32.GlobalUnlock(ctypes.c_void_p(handle))
     finally:
         user32.CloseClipboard()
 
 
-def paste_text(text):
-    _set_clipboard(text)
+def _get_clipboard_text():
+    return _clipboard_peek()[0]
+
+
+def paste_text(text, restore_text=None):
+    if not _set_clipboard(text):
+        return 0, 4
     time.sleep(0.05)
     sent = _send([_vk_event(0x11), _vk_event(0x56), _vk_event(0x56, True), _vk_event(0x11, True)])
+    if restore_text is not None:
+        time.sleep(0.25)
+        _set_clipboard(restore_text)
     return sent, 4
 
 
@@ -1021,12 +1140,48 @@ def _fg_info():
     return f"{int(hwnd or 0):#x} {cls.value} {title.value!r}"
 
 
-def inject_text(text, mode="unicode"):
+def _qt_like(hwnd):
+    cls = _class_name(hwnd).lower()
+    return "qt5" in cls or "qt6" in cls
+
+
+def _weixin_like(hwnd):
+    if not _qt_like(hwnd):
+        return False
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(pid))
+    return bool(pid.value) and "weixin" in process_image_name(pid.value)
+
+
+def _current_focus():
+    fg = int(user32.GetForegroundWindow() or 0)
+    if not fg:
+        return 0
+    tid = user32.GetWindowThreadProcessId(ctypes.c_void_p(fg), None)
+    focus, _ = _thread_focus(tid)
+    return focus or fg
+
+
+def inject_text(text, mode="auto", focus=None):
     if not text:
         return 0, 0
     log("foreground " + _fg_info())
     if mode == "paste":
         return paste_text(text)
+    if focus is None:
+        focus = _current_focus()
+    if mode == "auto" and _weixin_like(focus):
+        old, has_data = _clipboard_peek()
+        if old is not None or has_data is False:
+            # 微信 4.x 的 Qt 输入框逐字注入会丢字，整段粘贴更可靠
+            log(f"inject auto-paste class={_class_name(focus)}")
+            return paste_text(text, restore_text=old)
+        log(f"inject auto-type class={_class_name(focus)} clipboard=busy-or-non-text")
+        return type_text(text, QT_TYPE_DELAY)
+    if _qt_like(focus):
+        if mode == "auto":
+            log(f"inject qt-paced class={_class_name(focus)}")
+        return type_text(text, QT_TYPE_DELAY)
     return type_text(text)
 
 
@@ -1060,6 +1215,10 @@ user32.GetAsyncKeyState.restype = ctypes.c_short
 user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 user32.GetClassNameW.restype = ctypes.c_int
 user32.GetClassNameW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR, ctypes.c_int]
+user32.GetWindowTextLengthW.restype = ctypes.c_int
+user32.GetWindowTextLengthW.argtypes = [ctypes.c_void_p]
+user32.GetWindowTextW.restype = ctypes.c_int
+user32.GetWindowTextW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR, ctypes.c_int]
 
 
 def _send_timeout(hwnd, msg, wp=0, lp=0, timeout=120):
@@ -1124,6 +1283,17 @@ def _weak_allowed(hwnd):
     return any(hint in cls for hint in WEAK_CLASS_HINTS)
 
 
+def _window_title(hwnd):
+    if not hwnd:
+        return ""
+    n = int(user32.GetWindowTextLengthW(ctypes.c_void_p(hwnd)))
+    if n <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(n + 1)
+    user32.GetWindowTextW(ctypes.c_void_p(hwnd), buf, n + 1)
+    return buf.value
+
+
 def _tail_match(text, expected):
     if not text or not expected:
         return 0
@@ -1141,6 +1311,160 @@ def _text_variants(text):
     if variant != text:
         out.append(variant)
     return out
+
+
+# ------------------------------------------- WeChat 4.x (Qt) 输入框 UIA
+# 微信 4.x 的聊天输入框是 Qt 自绘控件，WM_GETTEXT 读不到内容，逐字注入偶发丢字。
+# 它通过 UIA 暴露 AutomationId=chat_input_field 的 Edit，可读可写，用于精确校验与修复。
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+
+def _guid(text):
+    u = uuid.UUID(text)
+    return _GUID(u.time_low, u.time_mid, u.time_hi_version,
+                 (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+
+
+class _VARIANT(ctypes.Structure):
+    _fields_ = [("vt", wintypes.WORD), ("r1", wintypes.WORD),
+                ("r2", wintypes.WORD), ("r3", wintypes.WORD),
+                ("v", ctypes.c_ulonglong), ("v2", ctypes.c_ulonglong)]
+
+
+_CLSID_CUIAUTOMATION = _guid("FF48DBA4-60EF-4201-AA87-54103EEF594E")
+_IID_IUIAUTOMATION = _guid("30CBE57D-D9D0-452A-AB13-7AC5AC4825EE")
+_UIA_CHAT_INPUT_ID = "chat_input_field"
+_UIA_AUTOMATION_ID_PROPERTY = 30011
+_UIA_VALUE_PATTERN_ID = 10002
+_UIA_TREESCOPE_DESCENDANTS = 4
+_UIA_VT_BSTR = 8
+
+ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+ole32.CoCreateInstance.restype = ctypes.c_long
+ole32.CoCreateInstance.argtypes = [ctypes.POINTER(_GUID), ctypes.c_void_p,
+                                   wintypes.DWORD, ctypes.POINTER(_GUID),
+                                   ctypes.POINTER(ctypes.c_void_p)]
+oleaut32.SysAllocString.restype = ctypes.c_void_p
+oleaut32.SysAllocString.argtypes = [wintypes.LPCWSTR]
+oleaut32.SysFreeString.argtypes = [ctypes.c_void_p]
+oleaut32.SysStringLen.restype = wintypes.UINT
+oleaut32.SysStringLen.argtypes = [ctypes.c_void_p]
+
+
+def _com_method(obj, index, restype, *argtypes):
+    vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    proto = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)
+    return proto(vtbl[index])
+
+
+def _com_release(obj):
+    if obj and obj.value:
+        _com_method(obj, 2, ctypes.c_ulong)(obj)
+
+
+def _uia_read_value(pat):
+    get_value = _com_method(pat, 4, ctypes.c_long, ctypes.POINTER(ctypes.c_void_p))
+    val = ctypes.c_void_p()
+    if get_value(pat, ctypes.byref(val)) != 0:
+        return None
+    if not val.value:
+        return ""
+    try:
+        n = int(oleaut32.SysStringLen(val))
+        return ctypes.wstring_at(val, n) if n else ""
+    finally:
+        oleaut32.SysFreeString(val)
+
+
+def _uia_set_value(pat, text):
+    set_value = _com_method(pat, 3, ctypes.c_long, wintypes.LPCWSTR)
+    return set_value(pat, text) == 0
+
+
+def _uia_input_action(hwnd, action):
+    """在 hwnd 下查找微信聊天输入框并执行 action(ValuePattern)；失败返回 None。"""
+    if not hwnd:
+        return None
+    if ole32.CoInitializeEx(None, 0) < 0:
+        return None
+    automation = ctypes.c_void_p()
+    el = ctypes.c_void_p()
+    cond = ctypes.c_void_p()
+    edit = ctypes.c_void_p()
+    pat = ctypes.c_void_p()
+    try:
+        if ole32.CoCreateInstance(ctypes.byref(_CLSID_CUIAUTOMATION), None, 1,
+                                  ctypes.byref(_IID_IUIAUTOMATION),
+                                  ctypes.byref(automation)) != 0 or not automation.value:
+            return None
+        element_from_handle = _com_method(automation, 6, ctypes.c_long, ctypes.c_void_p,
+                                          ctypes.POINTER(ctypes.c_void_p))
+        if element_from_handle(automation, ctypes.c_void_p(hwnd),
+                               ctypes.byref(el)) != 0 or not el.value:
+            return None
+        bstr = oleaut32.SysAllocString(_UIA_CHAT_INPUT_ID)
+        if not bstr:
+            return None
+        try:
+            var = _VARIANT(vt=_UIA_VT_BSTR,
+                           v=ctypes.cast(bstr, ctypes.c_void_p).value)
+            create_cond = _com_method(automation, 23, ctypes.c_long, ctypes.c_int,
+                                      _VARIANT, ctypes.POINTER(ctypes.c_void_p))
+            if create_cond(automation, _UIA_AUTOMATION_ID_PROPERTY, var,
+                           ctypes.byref(cond)) != 0 or not cond.value:
+                return None
+        finally:
+            oleaut32.SysFreeString(bstr)
+        find_first = _com_method(el, 5, ctypes.c_long, ctypes.c_int, ctypes.c_void_p,
+                                 ctypes.POINTER(ctypes.c_void_p))
+        if find_first(el, _UIA_TREESCOPE_DESCENDANTS, cond,
+                      ctypes.byref(edit)) != 0 or not edit.value:
+            return None
+        get_pattern = _com_method(edit, 16, ctypes.c_long, ctypes.c_int,
+                                  ctypes.POINTER(ctypes.c_void_p))
+        if get_pattern(edit, _UIA_VALUE_PATTERN_ID, ctypes.byref(pat)) != 0 or not pat.value:
+            return None
+        return action(pat)
+    except Exception:
+        return None
+    finally:
+        _com_release(pat)
+        _com_release(edit)
+        _com_release(cond)
+        _com_release(el)
+        _com_release(automation)
+        ole32.CoUninitialize()
+
+
+def _uia_read_input(hwnd):
+    return _uia_input_action(hwnd, _uia_read_value)
+
+
+def _uia_write_input(hwnd, text):
+    return _uia_input_action(hwnd, lambda pat: _uia_set_value(pat, text))
+
+
+def _uia_wait_input(hwnd, before, timeout=0.8):
+    deadline = time.monotonic() + timeout
+    after = _uia_read_input(hwnd)
+    while after is not None and after == before and time.monotonic() < deadline:
+        time.sleep(0.12)
+        after = _uia_read_input(hwnd)
+    return after
+
+
+def _uia_verdict(before, after, text):
+    if before is None or after is None:
+        return "unknown"
+    if after == before:
+        return "fail"
+    for variant in _text_variants(text):
+        if variant in after:
+            return "ok"
+    return "fail"
 
 
 def _async_down(vk):
@@ -1258,13 +1582,13 @@ def replace_recent_text(expected, new, fg, focus, mode="unicode", guard=None):
             if guard and not guard():
                 return "changed"
             _select_backward(len(expected))
-            inject_text(new, mode)
+            inject_text(new, mode, focus_now)
             time.sleep(0.4)
             return "weak"
         if guard and not guard():
             _collapse_selection()
             return "changed"
-        inject_text(new, mode)
+        inject_text(new, mode, focus_now)
         deadline = time.monotonic() + 2.0 + len(new) / 3000.0
         after = None
         while True:
@@ -1286,7 +1610,7 @@ def replace_recent_text(expected, new, fg, focus, mode="unicode", guard=None):
         if guard and not guard():
             return "changed"
         _select_backward(len(expected))
-        inject_text(new, mode)
+        inject_text(new, mode, focus_now)
         time.sleep(0.4)
         return "weak"
     if not text:
@@ -1308,8 +1632,11 @@ def focus_snapshot():
     fg = int(user32.GetForegroundWindow() or 0)
     tid = user32.GetWindowThreadProcessId(ctypes.c_void_p(fg), None) if fg else 0
     focus, caret = _thread_focus(tid)
-    return {"fg": fg, "focus": focus, "caret": caret,
-            "text": _control_text(focus) if focus else None}
+    text = _control_text(focus) if focus else None
+    if text and _weak_allowed(focus) and text == _window_title(focus):
+        # Qt/微信 4.x 的 WM_GETTEXT 只回窗口标题，读不到输入框内容
+        text = None
+    return {"fg": fg, "focus": focus, "caret": caret, "text": text}
 
 
 def _same_target(snap):
@@ -4806,7 +5133,8 @@ class App:
                 else:
                     self.inject_and_report(text)
             else:
-                self.set_ui("done", "未识别到内容", auto_hide=2500)
+                if not isinstance(sess, AsrSession):
+                    self.set_ui("done", "未识别到内容", auto_hide=2500)
         except Exception:
             log("session error " + traceback.format_exc().replace("\n", " | "))
             self.set_ui("done", "识别出错，详见日志", auto_hide=3000)
@@ -4819,6 +5147,8 @@ class App:
             if press_mic:
                 self.mic.close()
             self.mic.detach(sess)
+            if isinstance(sess, AsrSession):
+                self._after_local_session(sess)
             with self.lock:
                 self.session = None
             hk = self.hotkey
@@ -4832,6 +5162,36 @@ class App:
                 self.set_ui("none")
             self.once_done.set()
 
+    def _after_local_session(self, sess):
+        eng = sess.engine
+        if sess.cancelled or not sess.finished:
+            return
+        if sess.text.strip():
+            if self.engine is eng:
+                eng.note_success()
+            return
+        if self.engine is not eng or self.testing:
+            self.set_ui("done", "未识别到内容", auto_hide=2500)
+            return
+        if not sess.had_speech:
+            self.set_ui("done", "未识别到内容", auto_hide=2500)
+            return
+        log(f"local asr empty speech={sess.speech_sec:.2f}s")
+        if not eng.note_failure():
+            self.set_ui("done", "识别失败，请重试或切换引擎", auto_hide=3000, toast=True)
+            return
+        self.set_ui("wait", "识别失败，正在自动更换设备号…", toast=True)
+        try:
+            new_did = eng.rotate_device()
+        except Exception:
+            log("local did rotate error " + traceback.format_exc().replace("\n", " | "))
+            self.set_ui("done", "更换设备号失败，请重试或切换引擎",
+                        auto_hide=3500, toast=True)
+            return
+        log(f"local did rotated after one failure -> {new_did}")
+        self.set_ui("done", "已自动更换设备号，请重试；仍失败可切换引擎",
+                    auto_hide=3500, toast=True)
+
     def inject_and_report(self, text):
         with self.input_lock:
             self.undo_rec = None
@@ -4843,15 +5203,37 @@ class App:
             log("inject fail: no foreground window")
             self.set_ui("fail", "未找到输入窗口，已复制到剪贴板", auto_hide=3200)
             return
+        uia_before = None
+        if _weixin_like(snap["focus"]):
+            uia_before = _uia_read_input(snap["focus"])
+            if uia_before is not None:
+                log(f"inject uia before={len(uia_before)} chars")
         log(f"injecting {len(text)} chars")
-        sent, expected = inject_text(text, self.args.inject)
+        sent, expected = inject_text(text, self.args.inject, snap["focus"])
         time.sleep(0.35)
         res = verify_injection(snap, text)
+        uia_verified = False
+        if uia_before is not None:
+            uia_after = _uia_wait_input(snap["focus"], uia_before)
+            if uia_after is not None:
+                res = _uia_verdict(uia_before, uia_after, text)
+                uia_verified = res == "ok"
+                log(f"inject uia after={len(uia_after)} chars verdict={res}")
+                if (res == "fail" and not uia_before.strip()
+                        and uia_after == uia_before and _same_target(snap)):
+                    log("inject uia repair=set")
+                    if _uia_write_input(snap["focus"], text):
+                        uia_after = _uia_wait_input(snap["focus"], uia_before)
+                        if uia_after is not None:
+                            res = _uia_verdict(uia_before, uia_after, text)
+                            uia_verified = res == "ok"
+                            log(f"inject uia repair={res} after={len(uia_after)} chars")
         log(f"inject verify={res} sent={sent}/{expected}")
-        sent_ok = not expected or sent == expected
+        sent_ok = not expected or sent == expected or uia_verified
         # 微信 Qt、Chrome/Electron 的编辑框读不回文字，校验必然 fail/unknown，
-        # 但按键实际已送达，按弱校验继续，后续用按键回退替换
-        weak_ok = sent_ok and res in ("fail", "unknown") and _weak_allowed(snap["focus"])
+        # 但按键实际已送达，按弱校验继续；UIA 能读到微信输入框时不放行。
+        weak_ok = (sent_ok and uia_before is None and res in ("fail", "unknown")
+                   and _weak_allowed(snap["focus"]))
         if weak_ok:
             log(f"inject weak-ok class={_class_name(snap['focus'])}")
         if (res == "ok" or weak_ok) and sent_ok:
@@ -5201,8 +5583,9 @@ def main():
     ap.add_argument("--wav", help="用 wav 文件代替麦克风（调试用）")
     ap.add_argument("--engine", choices=ASR_ENGINES, default=None,
                     help="识别引擎：doubao / doubao_api / qwen / wetype / baidu / ifly（默认读取设置）")
-    ap.add_argument("--inject", choices=["unicode", "paste"], default="unicode",
-                    help="文字注入方式：unicode 逐字输入 / paste 剪贴板粘贴")
+    ap.add_argument("--inject", choices=["auto", "unicode", "paste"], default="auto",
+                    help="文字注入方式：auto 自动（微信 4.x 用粘贴 + UIA 校验，其余逐字输入）/ "
+                         "unicode 逐字输入 / paste 剪贴板粘贴")
     ap.add_argument("--no-inject", action="store_true", help="只识别不输入")
     ap.add_argument("--no-ui", action="store_true", help="不显示悬浮提示")
     ap.add_argument("--no-tray", action="store_true", help="不显示托盘图标")
