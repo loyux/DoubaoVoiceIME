@@ -41,7 +41,8 @@ HOTWORDS_HEADER = ("# 热词替换：每行一条，格式：原文 -> 替换为
                    "# 以 # 开头的行会被忽略，修改后下次识别自动生效\n")
 ICON_NAME = "icon.ico"
 FLOAT_ICON_NAME = "float.ico"
-APP_RELEASE = "2.2.3"
+APP_RELEASE = "2.2.4"
+PROJECT_URL = "https://github.com/yc-2018/DoubaoVoiceIME"
 DEFAULT_HOTKEY = "RALT"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "DoubaoVoice"
@@ -3217,6 +3218,8 @@ class Settings:
     ID_SMART_HOTKEY_LABEL = 2127
     ID_SMART_HOTKEY_CLEAR = 2128
     ID_FLOAT = 2129
+    ID_UPDATE = 2130
+    ID_FEEDBACK = 2131
     ID_HOTWORD_SECTION = 2218
     ID_HOTWORD_LINE = 2219
     ID_HOTWORD_SRC = 2220
@@ -3508,6 +3511,12 @@ class Settings:
         if hwnd:
             user32.SetWindowTextW(hwnd, text)
 
+    def _open_project(self, path):
+        try:
+            os.startfile(f"{PROJECT_URL}/{path}")
+        except Exception:
+            log("open project url error " + traceback.format_exc().replace("\n", " | "))
+
     def _build_controls(self):
         LX, RX, LW, RW = 16, 464, 400, 400
         self._section("语音输入方式", 12, 2201, 2211, LX, LW)
@@ -3595,6 +3604,10 @@ class Settings:
                  BS_AUTOCHECKBOX | WS_TABSTOP, LX, bottom - 32, 440, 22, self.ID_FLOAT)
         self._mk("BUTTON", "开机自启", BS_AUTOCHECKBOX | WS_TABSTOP,
                  LX, bottom, 160, 22, self.ID_AUTOSTART)
+        self._mk("BUTTON", "检查更新", WS_TABSTOP,
+                 RX + RW - 320, bottom - 4, 100, 28, self.ID_UPDATE)
+        self._mk("BUTTON", "意见反馈", WS_TABSTOP,
+                 RX + RW - 212, bottom - 4, 100, 28, self.ID_FEEDBACK)
         self._mk("BUTTON", "关闭", WS_TABSTOP, RX + RW - 88, bottom - 4, 88, 30, self.ID_CLOSE)
 
         for cid, items in ((self.ID_ENGINE, ENGINE_ITEMS),
@@ -3693,6 +3706,10 @@ class Settings:
                 self.refresh()
         elif cid == self.ID_FLOAT and code == BN_CLICKED:
             app.set_float_visible(self._checked(self.ID_FLOAT))
+        elif cid == self.ID_UPDATE and code == BN_CLICKED:
+            self._open_project("releases/latest")
+        elif cid == self.ID_FEEDBACK and code == BN_CLICKED:
+            self._open_project("issues/new")
         elif cid == self.ID_SMART and code == BN_CLICKED:
             if not app.set_smart_text(self._checked(self.ID_SMART)):
                 self.refresh()
