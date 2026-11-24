@@ -146,9 +146,14 @@ def format_text(text, punctuation="keep_all", paragraph="none"):
     return text.strip()
 
 
-def smart_organize(text):
+def format_transcript(text, config):
+    return apply_hotwords(format_text(text, config.get("punctuation_mode"),
+                                     config.get("paragraph_mode")))
+
+
+def smart_organize(text, organizer=None):
     try:
-        content, no_rewrite = api_smart.organize(text)
+        content, no_rewrite = (organizer or api_smart.organize)(text)
     except Exception as exc:
         return "error", str(exc)
     if no_rewrite:
@@ -312,10 +317,11 @@ def open_pcm_wav(path):
     return audio
 
 
-def push_wav(sess, audio):
+def push_wav(sess, audio, pace=True):
     deadline = time.monotonic()
     while not sess.cancelled and (data := audio.readframes(640)):
         sess.push(data)
-        deadline += len(data) / 32000
-        time.sleep(max(0, deadline - time.monotonic()))
+        if pace:
+            deadline += len(data) / 32000
+            time.sleep(max(0, deadline - time.monotonic()))
     sess.request_release()

@@ -12,7 +12,8 @@ import time
 import traceback
 from pathlib import Path
 
-ACTIONS = ("start", "stop", "toggle", "cancel", "settings", "quit")
+ACTIONS = ("start", "stop", "start-local", "stop-local", "toggle", "cancel", "settings", "quit")
+LOCAL_ENGINE = "qwen_local"
 CREDENTIALS = struct.Struct("3i")
 MAX_RECORDING_SECONDS = 30
 
@@ -61,16 +62,25 @@ def launcher_command():
     return [str(launcher)] if launcher.is_file() else [sys.executable, str(app_dir / "voice_ime.py")]
 
 
-def recognize_wav(args, config):
-    from voice_core import create_cloud_engine, open_pcm_wav, push_wav, log
+def new_session(config, verbose, on_text=None, cancelled=None):
+    if config["asr_engine"] == LOCAL_ENGINE:
+        from api_llama import LocalASRSession
 
-    engine = create_cloud_engine(config["asr_engine"])
+        return LocalASRSession(config, cancelled if cancelled is not None else threading.Event(), on_text)
+    from voice_core import create_cloud_engine
+
+    return create_cloud_engine(config["asr_engine"]).new_session(verbose, on_text=on_text)
+
+
+def recognize_wav(args, config):
+    from voice_core import open_pcm_wav, push_wav, log
+
     session = None
     try:
         with open_pcm_wav(args.wav) as audio:
-            session = engine.new_session(args.verbose)
+            session = new_session(config, args.verbose)
             session.start()
-            push_wav(session, audio)
+            push_wav(session, audio, pace=config["asr_engine"] != LOCAL_ENGINE)
             session.finish()
             result = finalize_text(session, config)
         if not result:
@@ -91,10 +101,9 @@ def recognize_wav(args, config):
 
 
 def finalize_text(session, config, on_organizing=None):
-    from voice_core import apply_hotwords, format_text, log, smart_organize
+    from voice_core import apply_hotwords, format_transcript, log, smart_organize
 
-    original = apply_hotwords(format_text(session.text, config.get("punctuation_mode"),
-                                         config.get("paragraph_mode")))
+    original = format_transcript(session.text, config)
     if not original:
         error = getattr(session, "_error", None)
         if error is not None:
@@ -102,28 +111,31 @@ def finalize_text(session, config, on_organizing=None):
     elif config.get("smart_text") is True and 5 <= len(original) <= 12000:
         if on_organizing is not None:
             on_organizing()
-        outcome, result = smart_organize(original)
+        local = config.get("asr_engine") == LOCAL_ENGINE
+        if local:
+            from api_llama import organize
+
+            outcome, result = smart_organize(original, lambda text: organize(text, config))
+        else:
+            outcome, result = smart_organize(original)
         if outcome == "rewrite":
-            return apply_hotwords(result) or original
+            return (format_transcript(result, config) if local else apply_hotwords(result)) or original
         if outcome == "error":
             log(f"smart organize failed: {result}")
     return original
 
 
 class Recording:
-    """Feed the microphone into a single cloud session and gate short taps locally."""
+    """Feed the microphone into one transcription session and gate short taps locally."""
 
     def __init__(self, mic, config, verbose, hold_ms, on_live, on_status, on_done):
-        from voice_core import create_cloud_engine
-
         self.mic = mic
         self.config = config.copy()
         self.hold_seconds = hold_ms / 1000
         self.on_status = on_status
         self.on_done = on_done
-        engine = create_cloud_engine(config["asr_engine"])
-        self.session = engine.new_session(verbose, on_text=on_live)
         self.cancelled = threading.Event()
+        self.session = new_session(config, verbose, on_text=on_live, cancelled=self.cancelled)
         self.finished = threading.Event()
         self.started = time.monotonic()
 
@@ -156,8 +168,10 @@ class Recording:
                 if not self.cancelled.is_set():
                     self.session.finish()
                 if not self.cancelled.is_set():
+                    message = ("正在本地整理…" if self.config["asr_engine"] == LOCAL_ENGINE
+                               else "正在整理文字…")
                     result = finalize_text(self.session, self.config,
-                                           lambda: self.on_status("正在整理文字…"))
+                                           lambda: self.on_status(message))
         except Exception as exc:
             log(traceback.format_exc())
             error = str(exc)
@@ -176,6 +190,7 @@ def main():
     commands = parser.add_mutually_exclusive_group()
     for action, help_text in (
         ("start", "开始长按录音"), ("stop", "结束长按录音"), ("toggle", "开始或结束免按录音"),
+        ("start-local", "开始本地录音"), ("stop-local", "结束本地录音并整理"),
         ("cancel", "取消录音"), ("settings", "打开设置"), ("quit", "退出正在运行的实例"),
     ):
         commands.add_argument(f"--{action}", action="store_const", dest="action",
@@ -187,7 +202,7 @@ def main():
     parser.add_argument("--no-ui", action="store_true", help="隐藏录音浮层")
     parser.add_argument("--no-tray", action="store_true", help="隐藏托盘图标")
     parser.add_argument("--verbose", action="store_true", help="记录识别中间结果")
-    parser.add_argument("--engine", choices=("doubao_api", "qwen", "wetype", "baidu", "ifly"),
+    parser.add_argument("--engine", choices=("doubao_api", "qwen", "wetype", "baidu", "ifly", LOCAL_ENGINE),
                         help="本次运行使用的识别引擎")
     args = parser.parse_args()
     if bool(args.wav) != args.once or (args.once and args.action):
@@ -205,7 +220,11 @@ def main():
 
     config = load_config()
     kind = args.engine or config.get("asr_engine")
-    config["asr_engine"] = kind if isinstance(kind, str) and kind in CLOUD_ENGINES else "doubao_api"
+    config["asr_engine"] = kind if isinstance(kind, str) and (
+        kind in CLOUD_ENGINES or kind == LOCAL_ENGINE
+    ) else "doubao_api"
+    if config["asr_engine"] == LOCAL_ENGINE:
+        config["smart_text"] = True
     if args.once:
         return recognize_wav(args, config)
 

@@ -1,4 +1,6 @@
 import argparse
+import base64
+import io
 import os
 import tempfile
 import threading
@@ -9,7 +11,10 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from voice_core import Mic
-from voice_linux import Recording, open_control_socket, receive_action, recognize_wav, send_action
+from voice_linux import (
+    LOCAL_ENGINE, Recording, finalize_text, open_control_socket, receive_action, recognize_wav,
+    send_action,
+)
 
 
 class LinuxVoiceTests(unittest.TestCase):
@@ -20,6 +25,8 @@ class LinuxVoiceTests(unittest.TestCase):
                     open_control_socket()
                 send_action("toggle")
                 self.assertEqual(receive_action(server), "toggle")
+                send_action("start-local")
+                self.assertEqual(receive_action(server), "start-local")
                 send_action("unknown")
                 self.assertIsNone(receive_action(server))
 
@@ -116,6 +123,62 @@ class LinuxVoiceTests(unittest.TestCase):
             self.assertTrue(encoder.encode(b"\0" * 640))
         finally:
             encoder.close()
+
+    def test_local_asr_sends_pcm_as_wav_and_strips_language_header(self):
+        from api_llama import transcribe
+
+        pcm = b"\x01\0" * 160
+        with patch("api_llama._asr.complete", return_value="language Chinese<asr_text>这是语音。") as infer:
+            self.assertEqual(transcribe(pcm, {}), "这是语音。")
+        audio = infer.call_args.args[1][0]["content"][0]["input_audio"]
+        with wave.open(io.BytesIO(base64.b64decode(audio["data"])), "rb") as wav:
+            self.assertEqual((wav.getframerate(), wav.getnchannels(), wav.getsampwidth()),
+                             (16000, 1, 2))
+            self.assertEqual(wav.readframes(160), pcm)
+
+    def test_local_stream_previews_buffered_and_live_audio_until_release(self):
+        from api_llama import LocalASRSession
+
+        on_text = Mock()
+        config = {"asr_engine": LOCAL_ENGINE}
+        session = LocalASRSession(config, threading.Event(), on_text)
+        self.addCleanup(session.close)
+        early, live = b"\x01\0" * 160, b"\x02\0" * 160
+        with (patch("api_llama.check_local_setup"),
+              patch("api_preview.model_available", return_value=True),
+              patch("api_preview.StreamingPreview") as preview,
+              patch("api_llama.transcribe", return_value="最终转录") as transcribe):
+            session.push(early)
+            session.start()
+            preview.return_value.push.assert_called_once_with(early)
+            session.push(live)
+            preview.return_value.push.assert_called_with(live)
+            emit = preview.call_args.args[0]
+            emit("流式预览")
+            on_text.assert_called_once_with("流式预览")
+            transcribe.assert_not_called()
+
+            session.request_release()
+            preview.return_value.stop.assert_called_once_with()
+            emit("迟到的预览")
+            session.push(b"\x03\0")
+            session.finish()
+            transcribe.assert_called_once_with(early + live, config)
+            self.assertEqual([call.args[0] for call in on_text.call_args_list],
+                             ["流式预览", "最终转录"])
+
+    def test_local_transcript_uses_local_editor_and_keeps_original_on_error(self):
+        session = Mock(text="这是本地识别结果")
+        config = {"asr_engine": LOCAL_ENGINE, "smart_text": True}
+        with (patch("voice_core.load_hotwords", return_value=[]),
+              patch("voice_core.log"),
+              patch("voice_core.api_smart.organize") as cloud,
+              patch("api_llama.organize", return_value=("这是本地整理结果。", False)) as local):
+            self.assertEqual(finalize_text(session, config), "这是本地整理结果。")
+            local.assert_called_once_with(session.text, config)
+            local.side_effect = RuntimeError("编辑失败")
+            self.assertEqual(finalize_text(session, config), session.text)
+            cloud.assert_not_called()
 
 
 if __name__ == "__main__":

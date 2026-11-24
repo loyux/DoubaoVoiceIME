@@ -1,6 +1,6 @@
 # Linux 版
 
-Linux 版提供豆包、千问、微信输入法、百度输入法和讯飞五个云端识别引擎。可以用全局快捷键长按录音，或按一次开始、再按一次结束。识别结果可以回填到原窗口、留在剪贴板，也可以在设置窗口查看和手动复制。识别需要联网。
+Linux 版提供豆包、千问、微信输入法、百度输入法和讯飞五个云端识别引擎，以及基于 llama.cpp 的本地试用模式。可以用全局快捷键长按录音，或按一次开始、再按一次结束。识别结果可以回填到原窗口、留在剪贴板，也可以在设置窗口查看和手动复制。云端识别需要联网。
 
 ## 安装和运行
 
@@ -108,3 +108,36 @@ WAV 模式接受 16 kHz、16 bit、单声道 PCM，向终端输出识别文本�
 设置、设备标识和 `hotwords.txt` 默认在 `~/.config/doubao-voice/`，日志默认在 `~/.local/state/doubao-voice/logs/`。程序遵循 `XDG_CONFIG_HOME` 和 `XDG_STATE_HOME`。
 
 一次粘贴可用目标应用的撤销功能撤回。
+
+## F9 本地转录和整理
+
+按住 F9 说话时，屏幕底部浮层逐步显示 Zipformer 的本地预览。松开后，Qwen3-ASR-0.6B 根据完整录音转录，Qwen3-1.7B 整理文字，结果在同一浮层更新并粘贴。转录和整理通过本机的 llama.cpp 运行，首次使用时加载模型，后续录音复用模型。
+
+准备支持 Qwen3-ASR 音频分块修复的 `llama-server`。可以使用 PATH 里的二进制，或将 llama.cpp 的完整运行目录放到 `~/.local/share/doubao-voice/llama.cpp/`。模型默认读取 `~/.local/share/doubao-voice/models/`，也可以在设置窗口分别选择 GGUF。设置 `XDG_DATA_HOME` 时优先使用该目录下的 `doubao-voice/`。
+
+| 文件 | 来源 |
+| --- | --- |
+| `Qwen3-ASR-0.6B-Q8_0.gguf` | [Qwen3-ASR GGUF](https://www.modelscope.cn/models/ggml-org/Qwen3-ASR-0.6B-GGUF/files) |
+| `mmproj-Qwen3-ASR-0.6B-Q8_0.gguf` | [配套音频编码器](https://www.modelscope.cn/models/ggml-org/Qwen3-ASR-0.6B-GGUF/files) |
+| `Qwen3-1.7B-Q4_K_M.gguf` | [Qwen3 文字整理模型](https://www.modelscope.cn/models/unsloth/Qwen3-1.7B-GGUF/files) |
+
+启用边说边预览时，在应用使用的 Python 环境安装依赖。
+
+```sh
+.venv-linux/bin/python -m pip install sherpa-onnx numpy
+```
+
+从 [Zipformer 中英双语模型](https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/tree/main) 下载 `encoder-epoch-99-avg-1.int8.onnx`、`decoder-epoch-99-avg-1.onnx`、`joiner-epoch-99-avg-1.int8.onnx` 和 `tokens.txt`，放到上述模型目录的 `zipformer-zh-en/` 子目录。全精度解码器可减少预览中的重字，已有 INT8 解码器的安装可以补上该文件。流式依赖或模型缺失时，仍可松键后转录和整理。
+
+Hyprland 的 Lua 绑定可以沿用前文的启动脚本路径。
+
+```lua
+hl.bind("F9", hl.dsp.exec_cmd(doubao_voice .. " --start-local"))
+hl.bind("F9", hl.dsp.exec_cmd(doubao_voice .. " --stop-local"), { release = true })
+```
+
+也可以从终端用 WAV 文件测试本地转录和整理。
+
+```sh
+./doubao-voice --engine qwen_local --once --wav speech.wav
+```

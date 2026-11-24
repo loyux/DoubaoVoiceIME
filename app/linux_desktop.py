@@ -19,9 +19,9 @@ from gi.repository import Gdk, Gio, GLib, Gtk, Pango
 
 from voice_core import (
     APP_RELEASE, CLOUD_ENGINES, HOTWORDS_PATH, LOG_DIR, MIN_HOLD_DEFAULT, MIN_HOLD_MS, Mic,
-    list_input_devices, log, resolve_mic_device, save_config,
+    format_transcript, list_input_devices, log, resolve_mic_device, save_config,
 )
-from voice_linux import MAX_RECORDING_SECONDS, Recording, launcher_command, receive_action
+from voice_linux import LOCAL_ENGINE, MAX_RECORDING_SECONDS, Recording, launcher_command, receive_action
 from wayland_keyboard import active_window
 
 NAME = "豆包语音输入"
@@ -256,6 +256,7 @@ class Desktop:
             device = resolve_mic_device(config.get("mic_device"))
         self.mic = Mic(device)
         self.recording = None
+        self.recording_from_local_key = False
         self.target = None
         self.live = ""
         self.result = ""
@@ -282,12 +283,13 @@ class Desktop:
 
     def read_command(self, _source, _condition):
         action = receive_action(self.server)
-        if action == "start":
+        if action in ("start", "start-local"):
             hold = self.config.get("min_hold_ms")
             self.start_recording(hold if type(hold) is int and hold in MIN_HOLD_MS
-                                 else MIN_HOLD_DEFAULT)
-        elif action == "stop":
-            self.stop_recording()
+                                 else MIN_HOLD_DEFAULT, local_key=action == "start-local")
+        elif action in ("stop", "stop-local"):
+            if self.recording_from_local_key == (action == "stop-local"):
+                self.stop_recording()
         elif action == "toggle":
             self.toggle()
         elif action == "cancel":
@@ -369,18 +371,22 @@ class Desktop:
         if self.config.get("mic_mode") == "always":
             self.prewarm_mic()
 
-    def start_recording(self, hold_ms=0):
+    def start_recording(self, hold_ms=0, local_key=False):
         if self.recording is not None:
             return
         self.live = ""
         self.target = self.input.target() if not self.args.no_inject else None
         if self.settings is not None and self.settings.window.is_active():
             self.target = None
-        job = Recording(self.mic, self.config, self.args.verbose, hold_ms,
+        config = self.config
+        if local_key:
+            config = dict(config, asr_engine=LOCAL_ENGINE, smart_text=True)
+        job = Recording(self.mic, config, self.args.verbose, hold_ms,
                         lambda text: GLib.idle_add(self.live_text, job, text),
                         lambda status: GLib.idle_add(self.job_status, job, status),
                         lambda *result: GLib.idle_add(self.recording_done, *result))
         self.recording = job
+        self.recording_from_local_key = local_key
         try:
             job.start()
         except Exception as exc:
@@ -389,7 +395,7 @@ class Desktop:
             log(traceback.format_exc())
             self.report(f"麦克风打开失败：{exc}", dismiss=True)
             return
-        self.report("正在录音…")
+        self.report("正在本地录音…" if config["asr_engine"] == LOCAL_ENGINE else "正在录音…")
         self.capture_timer = GLib.timeout_add_seconds(MAX_RECORDING_SECONDS, self.time_limit)
 
     def toggle(self):
@@ -411,7 +417,8 @@ class Desktop:
             GLib.source_remove(self.capture_timer)
             self.capture_timer = 0
         job.stop(cancel)
-        self.report("已取消" if job.cancelled.is_set() else "正在转文字…",
+        message = "正在本地转文字…" if job.config["asr_engine"] == LOCAL_ENGINE else "正在转文字…"
+        self.report("已取消" if job.cancelled.is_set() else message,
                     dismiss=job.cancelled.is_set())
 
     def recording_done(self, job, text, error):
@@ -439,6 +446,8 @@ class Desktop:
 
     def live_text(self, job, text):
         if self.recording is job and not job.cancelled.is_set():
+            if job.config["asr_engine"] == LOCAL_ENGINE:
+                text = format_transcript(text, job.config)
             self.live = text
             self.report(self.status)
 
@@ -522,6 +531,9 @@ class Settings:
         self.combo("粘贴快捷键", "paste_shortcut", [
             ("normal", "Ctrl+V"), ("terminal", "Ctrl+Shift+V（终端）"),
         ])
+        self.model_file("F9 语音模型", "local_asr_model")
+        self.model_file("F9 音频编码器", "local_asr_projector")
+        self.model_file("F9 整理模型", "local_edit_model")
         self.checkbox("麦克风预热", self.config.get("mic_mode") == "always",
                       lambda enabled: app.update_config("mic_mode", "always" if enabled else "press"))
         self.checkbox("识别后用豆包整理文字", self.config.get("smart_text") is True,
@@ -577,6 +589,23 @@ class Settings:
         widget = Gtk.CheckButton(label=label, active=selected, height_request=36)
         self.toggles.pack_start(widget, True, True, 0)
         widget.connect("toggled", lambda button: callback(button.get_active()))
+
+    def model_file(self, label, key):
+        from api_llama import model_path
+
+        field = Gtk.FileChooserButton(title=label, action=Gtk.FileChooserAction.OPEN)
+        file_filter = Gtk.FileFilter()
+        file_filter.set_name("GGUF")
+        file_filter.add_pattern("*.gguf")
+        field.add_filter(file_filter)
+        file = model_path(self.config, key)
+        if file.is_file():
+            field.set_filename(str(file))
+        field.set_hexpand(True)
+        field.connect("file-set", lambda chooser: self.app.update_config(key, chooser.get_filename()))
+        self.controls.attach(Gtk.Label(label=label, xalign=0), 0, self.row, 1, 1)
+        self.controls.attach(field, 1, self.row, 1, 1)
+        self.row += 1
 
     @staticmethod
     def button(container, label, callback):
