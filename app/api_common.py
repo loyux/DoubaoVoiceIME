@@ -11,17 +11,15 @@ import secrets
 import socket
 import ssl
 import struct
-import sys
 import threading
 import time
 import urllib.parse
+from pathlib import Path
 
 
 def app_dir():
-    # onefile 下 __file__ 指向临时解包目录，设备标识要放在 exe 同目录
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
+    config_home = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return str(Path(config_home) / "doubao-voice")
 
 
 APP_DIR = app_dir()
@@ -34,20 +32,6 @@ def log(message):
             logger(message)
         except Exception:
             pass
-
-
-def resource_path(name):
-    bases = []
-    meipass = getattr(__import__("sys"), "_MEIPASS", None)
-    if meipass:
-        bases.append(meipass)
-    bases.append(APP_DIR)
-    bases.append(os.path.dirname(os.path.abspath(getattr(__import__("sys"), "executable", ""))))
-    for base in bases:
-        path = os.path.join(base, name)
-        if os.path.isfile(path):
-            return path
-    return ""
 
 
 def now_ms():
@@ -71,6 +55,7 @@ def load_data(name):
 def save_data(name, obj):
     path = os.path.join(APP_DIR, name)
     try:
+        os.makedirs(APP_DIR, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False)
     except OSError:
@@ -518,33 +503,33 @@ class OpusEncoder:
 
     def __init__(self, bitrate=64000, complexity=9, application=APPLICATION_AUDIO,
                  vbr=None):
-        path = resource_path("opus.dll")
-        if not path:
-            raise RuntimeError("缺少 opus.dll")
-        self.dll = ctypes.CDLL(path)
-        self.dll.opus_encoder_create.restype = ctypes.c_void_p
-        self.dll.opus_encoder_create.argtypes = [ctypes.c_int, ctypes.c_int,
+        try:
+            self.lib = ctypes.CDLL("libopus.so.0")
+        except OSError as exc:
+            raise RuntimeError("缺少 libopus.so.0，请安装系统的 Opus 库") from exc
+        self.lib.opus_encoder_create.restype = ctypes.c_void_p
+        self.lib.opus_encoder_create.argtypes = [ctypes.c_int, ctypes.c_int,
                                                  ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
-        self.dll.opus_encode.restype = ctypes.c_int
-        self.dll.opus_encode.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+        self.lib.opus_encode.restype = ctypes.c_int
+        self.lib.opus_encode.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
                                          ctypes.c_void_p, ctypes.c_int]
-        self.dll.opus_encoder_ctl.restype = ctypes.c_int
-        self.dll.opus_encoder_ctl.argtypes = [ctypes.c_void_p]
-        self.dll.opus_encoder_destroy.argtypes = [ctypes.c_void_p]
+        self.lib.opus_encoder_ctl.restype = ctypes.c_int
+        self.lib.opus_encoder_ctl.argtypes = [ctypes.c_void_p]
+        self.lib.opus_encoder_destroy.argtypes = [ctypes.c_void_p]
         err = ctypes.c_int()
-        self.enc = self.dll.opus_encoder_create(16000, 1, application, ctypes.byref(err))
+        self.enc = self.lib.opus_encoder_create(16000, 1, application, ctypes.byref(err))
         if not self.enc or err.value != 0:
             raise RuntimeError(f"Opus 编码器创建失败 {err.value}")
-        self.dll.opus_encoder_ctl(self.enc, self.SET_BITRATE, bitrate)
-        self.dll.opus_encoder_ctl(self.enc, self.SET_COMPLEXITY, complexity)
+        self.lib.opus_encoder_ctl(self.enc, self.SET_BITRATE, bitrate)
+        self.lib.opus_encoder_ctl(self.enc, self.SET_COMPLEXITY, complexity)
         if vbr is not None:
-            self.dll.opus_encoder_ctl(self.enc, self.SET_VBR, vbr)
+            self.lib.opus_encoder_ctl(self.enc, self.SET_VBR, vbr)
         self.buf = ctypes.create_string_buffer(4000)
 
     def encode(self, pcm):
         samples = len(pcm) // 2
         src = (ctypes.c_int16 * samples).from_buffer_copy(pcm)
-        n = self.dll.opus_encode(self.enc, ctypes.cast(src, ctypes.c_void_p), samples,
+        n = self.lib.opus_encode(self.enc, ctypes.cast(src, ctypes.c_void_p), samples,
                                  ctypes.cast(self.buf, ctypes.c_void_p), len(self.buf))
         if n <= 0:
             raise RuntimeError(f"Opus 编码失败 {n}")
@@ -553,10 +538,10 @@ class OpusEncoder:
     def encode_baidu(self, pcm):
         data = self.encode(pcm)
         rng = ctypes.c_uint32()
-        self.dll.opus_encoder_ctl(self.enc, self.GET_FINAL_RANGE, ctypes.byref(rng))
+        self.lib.opus_encoder_ctl(self.enc, self.GET_FINAL_RANGE, ctypes.byref(rng))
         return struct.pack(">II", len(data), rng.value) + data
 
     def close(self):
         if self.enc:
-            self.dll.opus_encoder_destroy(self.enc)
+            self.lib.opus_encoder_destroy(self.enc)
             self.enc = None

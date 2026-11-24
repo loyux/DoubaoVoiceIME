@@ -1,9 +1,8 @@
 # 第三方组件声明
 
-## Opus（app/opus.dll）
+## Opus
 
-微信输入法识别引擎使用 `app/opus.dll` 做 Opus 编码。该库为 libopus 1.6.1，
-采用 BSD 3-Clause 许可，版权与许可全文如下。
+豆包云端、微信输入法和百度输入法引擎使用 Linux 系统提供的 `libopus.so.0` 做 Opus 编码。Opus 采用 BSD 3-Clause 许可，版权与许可全文如下。
 
 ```
 Copyright 2001-2023 Xiph.Org, Skype Limited, Octasic,

@@ -16,48 +16,58 @@ concurrency:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-          architecture: "x64"
-          cache: pip
-          cache-dependency-path: requirements.txt
-
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y python3-venv python3-gi gir1.2-gtk-3.0 libportaudio2 libopus0 xvfb xauth
+          python3 -m venv --system-site-packages .venv-linux
+          .venv-linux/bin/python -m pip install -r requirements.txt
 
-      - name: Syntax check
-        run: python -m py_compile app/voice_ime.py app/api_common.py app/api_doubao.py app/api_qwen.py app/api_wetype.py app/api_baidu.py app/api_ifly.py app/api_smart.py
-
-      - name: Build exe
-        run: python -m PyInstaller --noconfirm --clean DoubaoVoice_new.spec
-
-      - name: Verify artifacts
-        shell: pwsh
+      - name: Test
         run: |
-          $exe = Get-Item dist\DoubaoVoice.exe
-          Write-Host ("exe: {0:N0} bytes" -f $exe.Length)
-          if ($exe.Length -lt 10MB) { throw "exe too small, dll missing?" }
-          if ($exe.Length -ge 30MB) { throw "exe too large, smart runtime still included?" }
+          .venv-linux/bin/python -m compileall -q app
+          PYTHONPATH=app .venv-linux/bin/python -m unittest discover -s tests -v
+          xvfb-run -a sh -ec '
+            export XDG_CONFIG_HOME="$(mktemp -d)" XDG_STATE_HOME="$(mktemp -d)"
+            ./doubao-voice --settings --no-tray &
+            app_pid=$!
+            trap "kill $app_pid 2>/dev/null || true" EXIT
+            for attempt in $(seq 1 30); do
+              if ./doubao-voice --cancel 2>/dev/null; then break; fi
+              sleep 0.1
+            done
+            ./doubao-voice --cancel
+            ./doubao-voice --settings
+            ./doubao-voice --quit
+            wait "$app_pid"
+          '
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
+      - name: Package Linux source
+        run: |
+          mkdir -p dist
+          tar -czf dist/DoubaoVoice-linux.tar.gz doubao-voice requirements.txt README.md docs/linux.md THIRD_PARTY_NOTICES.md app/*.py
+
+      - uses: actions/upload-artifact@v7
         with:
-          name: DoubaoVoice-${{ github.sha }}
-          path: dist/DoubaoVoice.exe
+          name: DoubaoVoice-linux-${{ github.sha }}
+          path: dist/DoubaoVoice-linux.tar.gz
           if-no-files-found: error
 
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: DoubaoVoice-linux-${{ github.sha }}
+          path: dist
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $intro = "按住快捷键说话，松开自动输入。双击运行即可，托盘图标可设置快捷键和开机自启。支持豆包本地 DLL、豆包云端 API、千问、微信输入法、百度输入法、讯飞六种识别引擎，可在设置中切换。`n`n本版更新："
-          gh release create $env:GITHUB_REF_NAME dist\DoubaoVoice.exe --title "豆包语音输入 $env:GITHUB_REF_NAME" --notes $intro --generate-notes
+          gh release create "$GITHUB_REF_NAME" dist/DoubaoVoice-linux.tar.gz --repo "$GITHUB_REPOSITORY" --title "豆包语音输入 $GITHUB_REF_NAME" --generate-notes

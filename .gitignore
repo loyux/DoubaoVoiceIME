@@ -1,25 +1,6 @@
 __pycache__/
 *.py[cod]
+.venv-linux/
 build/
-build_next/
-build_next_lite/
 dist/
-dist_next/
-work/
 *.log
-logs/
-build_preview/
-dist_preview/
-
-# 云端识别引擎的本地设备标识（运行时生成）
-app/qwen.json
-app/wetype.json
-app/baidu.json
-app/doubao_api.json
-app/doubao_local.json
-
-# 本机设置（运行时生成）
-app/config.json
-
-# 热词替换规则（运行时生成）
-app/hotwords.txt
