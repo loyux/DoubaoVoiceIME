@@ -9,13 +9,13 @@ Linux 版提供豆包、千问、微信输入法、百度输入法和讯飞五�
 Arch Linux（Hyprland、Sway）
 
 ```sh
-sudo pacman -S python python-gobject gtk3 portaudio opus wl-clipboard gtk-layer-shell libayatana-appindicator
+sudo pacman -S python python-gobject python-cairo gtk3 portaudio opus wl-clipboard gtk-layer-shell libayatana-appindicator
 ```
 
 Debian / Ubuntu（Wayland）
 
 ```sh
-sudo apt install python3 python3-venv python3-gi gir1.2-gtk-3.0 libportaudio2 libopus0
+sudo apt install python3 python3-venv python3-gi python3-gi-cairo gir1.2-gtk-3.0 libportaudio2 libopus0
 sudo apt install wl-clipboard gir1.2-gtk-layer-shell-0.1 gir1.2-ayatanaappindicator3-0.1
 ```
 
@@ -33,7 +33,7 @@ python3 -m venv --system-site-packages .venv-linux
 
 应用会把结果留在剪贴板。Hyprland、Sway 和 X11 会检查前台窗口是否仍与录音开始时相同，再发送粘贴快捷键。其他 Wayland 桌面可使用“复制结果”或系统剪贴板。录音浮层在支持 layer-shell 的 Wayland 桌面及 X11 上可用。
 
-屏幕底部的小提示在录音时显示红点和音量，松开快捷键后显示“正在转文字…”和旋转图标。识别结束后，结果或错误提示会短暂保留。
+提示框居中显示在屏幕底部，分为两行。上行显示状态和音量，下行用整行宽度显示转录。录音时显示红点，松开快捷键后显示“正在转文字…”和旋转图标。长句显示最新一段，完整结果可以在设置里查看。
 
 ## 全局快捷键
 

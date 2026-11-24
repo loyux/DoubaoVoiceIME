@@ -9,11 +9,13 @@ import sys
 import traceback
 from pathlib import Path
 
+import cairo
 import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, Gio, GLib, Gtk
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango
 
 from voice_core import (
     APP_RELEASE, CLOUD_ENGINES, HOTWORDS_PATH, LOG_DIR, MIN_HOLD_DEFAULT, MIN_HOLD_MS, Mic,
@@ -24,6 +26,7 @@ from wayland_keyboard import active_window
 
 NAME = "豆包语音输入"
 ICON = "audio-input-microphone"
+OVERLAY_EDGE_MARGIN = 32
 OVERLAY_CSS = b"""
 window#doubao-voice-overlay { background-color: transparent; }
 #doubao-voice-panel {
@@ -163,6 +166,7 @@ class StatusOverlay:
         self.window.set_keep_above(True)
         self.window.set_skip_taskbar_hint(True)
         self.window.set_name("doubao-voice-overlay")
+        self.input_region = cairo.Region()
         screen = self.window.get_screen()
         visual = screen.get_rgba_visual()
         if visual is not None:
@@ -178,27 +182,33 @@ class StatusOverlay:
             layer.set_layer(self.window, layer.Layer.OVERLAY)
             layer.set_keyboard_mode(self.window, layer.KeyboardMode.NONE)
             layer.set_anchor(self.window, layer.Edge.BOTTOM, True)
-            layer.set_margin(self.window, layer.Edge.BOTTOM, 32)
+            layer.set_margin(self.window, layer.Edge.BOTTOM, OVERLAY_EDGE_MARGIN)
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         box.set_name("doubao-voice-panel")
-        line = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER)
+        box.set_direction(Gtk.TextDirection.LTR)
+        box.set_size_request(440, -1)
+        header = Gtk.Box(spacing=8)
         self.dot = Gtk.Label(label="●", no_show_all=True)
         self.dot.get_style_context().add_class("recording-dot")
-        self.spinner = Gtk.Spinner(no_show_all=True)
-        self.label = Gtk.Label(wrap=True, max_width_chars=32)
+        self.spinner = Gtk.Spinner(no_show_all=True, valign=Gtk.Align.CENTER)
+        self.label = Gtk.Label(xalign=0, single_line_mode=True, max_width_chars=32,
+                               ellipsize=Pango.EllipsizeMode.END)
         self.label.get_style_context().add_class("status-message")
-        self.transcript = Gtk.Label(wrap=True, max_width_chars=32, no_show_all=True)
+        self.transcript = Gtk.Label(xalign=0, single_line_mode=True, max_width_chars=48,
+                                    ellipsize=Pango.EllipsizeMode.START)
         self.transcript.get_style_context().add_class("transcript")
-        self.level = Gtk.LevelBar()
-        self.level.set_no_show_all(True)
-        line.pack_start(self.dot, False, False, 0)
-        line.pack_start(self.spinner, False, False, 0)
-        line.pack_start(self.label, True, True, 0)
-        box.pack_start(line, False, False, 0)
+        self.level = Gtk.LevelBar(no_show_all=True, valign=Gtk.Align.CENTER)
+        self.level.set_size_request(44, -1)
+        header.pack_start(self.dot, False, False, 0)
+        header.pack_start(self.spinner, False, False, 0)
+        header.pack_start(self.label, True, True, 0)
+        header.pack_start(self.level, False, False, 0)
+        box.pack_start(header, False, False, 0)
         box.pack_start(self.transcript, False, False, 0)
-        box.pack_start(self.level, False, False, 0)
         self.window.add(box)
+        _, line_height = self.transcript.create_pango_layout("转录").get_pixel_size()
+        self.transcript.set_size_request(-1, line_height)
 
     @staticmethod
     def make_click_through(window):
@@ -208,20 +218,22 @@ class StatusOverlay:
         if self.window is None:
             return
         self.label.set_text(message)
-        self.transcript.set_text(text[-120:])
-        self.transcript.set_visible(bool(text))
+        preview = " ".join(text[-120:].split())
+        self.transcript.set_text(preview)
         self.dot.set_visible(recording)
         self.spinner.set_visible(working)
         self.spinner.props.active = working
         self.level.set_visible(recording)
         self.window.show_all()
+        # A Wayland layer can get a new surface when it is shown again.
+        self.window.get_window().input_shape_combine_region(self.input_region, 0, 0)
         if self.layer_shell is None:
             display = self.window.get_display()
             _, x, y = display.get_default_seat().get_pointer().get_position()
             area = display.get_monitor_at_point(x, y).get_workarea()
             _, size = self.window.get_preferred_size()
             self.window.move(area.x + (area.width - size.width) // 2,
-                             area.y + area.height - size.height - 32)
+                             area.y + area.height - size.height - OVERLAY_EDGE_MARGIN)
 
     def hide(self):
         if self.window is not None:
@@ -348,11 +360,14 @@ class Desktop:
             saved["asr_engine"] = load_config().get("asr_engine", "doubao_api")
         save_config(saved)
         if self.recording is None and key in ("mic_mode", "mic_device"):
-            self.mic.close()
-            if self.args.device is None:
-                self.mic.device = resolve_mic_device(self.config.get("mic_device"))
-            if self.config.get("mic_mode") == "always":
-                self.prewarm_mic()
+            self.apply_mic_config()
+
+    def apply_mic_config(self):
+        self.mic.close()
+        if self.args.device is None:
+            self.mic.device = resolve_mic_device(self.config.get("mic_device"))
+        if self.config.get("mic_mode") == "always":
+            self.prewarm_mic()
 
     def start_recording(self, hold_ms=0):
         if self.recording is not None:
@@ -419,6 +434,8 @@ class Desktop:
             status = "识别完成" if self.args.no_inject else self.input.deliver(
                 text, self.target, job.config.get("paste_shortcut") == "terminal")
             self.report(status, dismiss=True, show_result=True)
+        if job.config.get("mic_mode") != self.config.get("mic_mode"):
+            self.apply_mic_config()
 
     def live_text(self, job, text):
         if self.recording is job and not job.cancelled.is_set():
@@ -474,8 +491,14 @@ class Settings:
         self.window.connect("delete-event", self.close)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=18)
         self.window.add(box)
+        self.toggles = Gtk.Box(spacing=8)
+        box.pack_start(self.toggles, False, False, 0)
         self.controls = Gtk.Grid(column_spacing=14, row_spacing=8)
-        box.pack_start(self.controls, False, False, 0)
+        options_scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                              vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+                                              propagate_natural_height=True)
+        options_scroller.add(self.controls)
+        box.pack_start(options_scroller, True, True, 0)
         self.row = 0
 
         self.combo("识别引擎", "asr_engine", [(k, v[0]) for k, v in CLOUD_ENGINES.items()])
@@ -551,9 +574,8 @@ class Settings:
             self.mic_combo = field
 
     def checkbox(self, label, selected, callback):
-        widget = Gtk.CheckButton(label=label, active=selected)
-        self.controls.attach(widget, 1, self.row, 1, 1)
-        self.row += 1
+        widget = Gtk.CheckButton(label=label, active=selected, height_request=36)
+        self.toggles.pack_start(widget, True, True, 0)
         widget.connect("toggled", lambda button: callback(button.get_active()))
 
     @staticmethod
